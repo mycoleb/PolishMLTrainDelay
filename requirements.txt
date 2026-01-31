@@ -1,0 +1,9 @@
+pandas>=2.1
+numpy>=1.26
+
+scikit-learn>=1.4
+
+folium>=0.15
+geopy>=2.4
+
+requests>=2.31
