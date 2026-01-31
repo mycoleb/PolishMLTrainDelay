@@ -7,3 +7,6 @@ folium>=0.15
 geopy>=2.4
 
 requests>=2.31
+cdsapi>=0.7.7
+xarray>=2024.1.0
+netcdf4>=1.6.5
