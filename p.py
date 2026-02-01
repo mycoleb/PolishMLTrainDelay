@@ -132,6 +132,9 @@ def _normalize_colname(s: str) -> str:
            .replace("ż", "z").replace("ź", "z").replace("ć", "c").replace("ę", "e").replace("ą", "a"))
     s = re.sub(r"\s+", " ", s)
     return s
+df["station"] = df["station"].replace({
+    "Jagodin": "Jagodzin",
+})
 
 def _read_station_month_table(local_csv: Path, value_name: str) -> pd.DataFrame:
     """
@@ -305,33 +308,50 @@ def geocode_stations(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def train_risk_model(df: pd.DataFrame) -> Tuple[Pipeline, pd.DataFrame]:
+def train_risk_model(df: pd.DataFrame, use_weather: bool = False) -> Tuple[Pipeline, pd.DataFrame]:
     """
     Train a model to predict delay_risk from features.
+    If use_weather=True, include ERA5 station-month weather features.
     """
-    # Basic features (easy, strong baseline)
-    features = ["month", "carrier", "station", "lat", "lon", "total_stops"]
+    base_features = ["month", "carrier", "station", "lat", "lon", "total_stops"]
+    weather_features = ["t2m_c", "precip_mm", "snowfall_mm", "wind_ms", "freezing", "heavy_rain", "windy"]
+
     df_model = df.dropna(subset=["delay_risk"]).copy()
 
-    # If geocoding failed for many stations, you can still model without lat/lon
-    # but the map will be limited. We'll fill missing lat/lon with median.
+    # Fill missing coords (needed for both models)
     for c in ["lat", "lon"]:
+        df_model[c] = pd.to_numeric(df_model[c], errors="coerce")
         df_model[c] = df_model[c].fillna(df_model[c].median())
+
+    features = base_features
+    numeric = ["month", "lat", "lon", "total_stops"]
+    categorical = ["carrier", "station"]
+
+    if use_weather:
+        # Ensure weather columns exist; if not, fail loudly with a helpful message
+        missing = [c for c in weather_features if c not in df_model.columns]
+        if missing:
+            raise KeyError(f"use_weather=True but missing weather columns: {missing}")
+
+        # Fill missing weather values
+        for c in weather_features:
+            df_model[c] = pd.to_numeric(df_model[c], errors="coerce")
+            df_model[c] = df_model[c].fillna(df_model[c].median())
+
+        features = base_features + weather_features
+        numeric = numeric + weather_features
 
     X = df_model[features]
     y = df_model["delay_risk"].astype(float)
 
-    numeric = ["month", "lat", "lon", "total_stops"]
-    categorical = ["carrier", "station"]
-
     pre = ColumnTransformer(
-    transformers=[
-        ("num", "passthrough", numeric),
-        ("cat", OneHotEncoder(handle_unknown="ignore", min_frequency=10, sparse_output=False), categorical),
-    ],
-    remainder="drop",
-    sparse_threshold=0.0,   # <- force dense output overall
-)
+        transformers=[
+            ("num", "passthrough", numeric),
+            ("cat", OneHotEncoder(handle_unknown="ignore", min_frequency=10, sparse_output=False), categorical),
+        ],
+        remainder="drop",
+        sparse_threshold=0.0,  # force dense output overall
+    )
 
     model = HistGradientBoostingRegressor(
         max_depth=6,
@@ -342,7 +362,6 @@ def train_risk_model(df: pd.DataFrame) -> Tuple[Pipeline, pd.DataFrame]:
 
     pipe = Pipeline([("prep", pre), ("model", model)])
 
-    # Train/test split (random baseline). For a portfolio upgrade: use time-based split.
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42)
 
     pipe.fit(X_train, y_train)
@@ -353,6 +372,7 @@ def train_risk_model(df: pd.DataFrame) -> Tuple[Pipeline, pd.DataFrame]:
     print("  R2 :", round(r2_score(y_test, preds), 4))
 
     return pipe, df_model
+
 
 def print_delay_risk_summary(df_model: pd.DataFrame):
     print("\n" + "=" * 70)
@@ -413,8 +433,29 @@ def make_risk_map(df_model: pd.DataFrame, pipe: Pipeline, predict_month: int = 1
         .agg({"lat": "median", "lon": "median", "total_stops": "mean"})
     )
     df_pred["month"] = int(predict_month)
+    # Add month-level weather from df_model (median per station for the chosen month)
+    wx_cols = ["t2m_c","precip_mm","snowfall_mm","wind_ms","freezing","heavy_rain","windy"]
+    wx_month = (
+        df_model[df_model["month"] == int(predict_month)]
+        .groupby("station", as_index=False)[wx_cols]
+        .median()
+    )
 
-    preds = pipe.predict(df_pred[["month", "carrier", "station", "lat", "lon", "total_stops"]]).clip(0, 1)
+    df_pred = df_pred.merge(wx_month, on="station", how="left")
+
+    # Fill any missing weather
+    # Fill any missing weather in df_pred using df_model medians
+    for c in wx_cols:
+        df_pred[c] = pd.to_numeric(df_pred[c], errors="coerce")
+        df_pred[c] = df_pred[c].fillna(df_model[c].median())
+
+
+    feature_cols = [
+        "month","carrier","station","lat","lon","total_stops",
+        "t2m_c","precip_mm","snowfall_mm","wind_ms",
+        "freezing","heavy_rain","windy",
+    ]
+    preds = pipe.predict(df_pred[feature_cols]).clip(0, 1)
     df_pred["pred_delay_risk"] = preds
 
     # Center map on Poland
@@ -434,6 +475,10 @@ def make_risk_map(df_model: pd.DataFrame, pipe: Pipeline, predict_month: int = 1
         return "#8b0000"
 
     # Plot only rows with valid coordinates
+    for c in ["t2m_c","precip_mm","snowfall_mm","wind_ms","freezing","heavy_rain","windy"]:
+        df_model[c] = df_model[c].fillna(df_model[c].median())
+
+
     df_plot = df_pred.dropna(subset=["lat", "lon"]).copy()
 
     for _, r in df_plot.iterrows():
@@ -513,21 +558,36 @@ def main():
 
     print("\nGeocoding stations (cached)...")
     df_geo = geocode_stations(df)
-    weather = pd.read_csv("outputs/weather_era5_land_monthly_2024_by_station.csv")
-    df_full = df_geo.merge(weather, on=["station", "month"], how="left")
-    print("Weather match rate:", df_full["t2m_c"].notna().mean())
 
-    print("\nTraining delay-risk model...")
-    pipe, df_model = train_risk_model(df_geo)
+    # --- load & merge weather ---
+    weather_path = OUT_DIR / "weather_era5_land_monthly_2024_by_station.csv"
+    if weather_path.exists():
+        weather = pd.read_csv(weather_path)
+        df_full = df_geo.merge(weather, on=["station", "month"], how="left")
+        print("Weather match rate:", df_full["t2m_c"].notna().mean())
+    else:
+        print("WARNING: weather file not found:", weather_path)
+        df_full = df_geo
 
-    print("\nGenerating map...")
-    make_risk_map(df_model, pipe, predict_month=12)
+    # --- baseline model (no weather) ---
+    print("\nTraining baseline model (no weather)...")
+    pipe_base, df_model_base = train_risk_model(df_geo, use_weather=False)
 
-    # Save modeling table for your repo
+    # --- weather model (with weather) ---
+    print("\nTraining weather model (with weather)...")
+    pipe_wx, df_model_wx = train_risk_model(df_full, use_weather=True)
+
+    print("\nGenerating map (weather model)...")
+    make_risk_map(df_model_wx, pipe_wx, predict_month=12)
+
+    # Summaries for the weather model
+    print_delay_risk_summary(df_model_wx)
+    print_summary_of_findings(df_model_wx)
+
+    # Save merged modeling table for your repo
     out_csv = OUT_DIR / "train_delay_risk_dataset_2024.csv"
-    df_geo.to_csv(out_csv, index=False)
+    df_full.to_csv(out_csv, index=False)
     print("Wrote dataset:", out_csv)
-
 
 if __name__ == "__main__":
     main()
